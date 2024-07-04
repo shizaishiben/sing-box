@@ -1427,7 +1427,17 @@
                   ]
                 },
                 "clash_mode": {
-                  "type": "string"
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  ]
                 },
                 "network_type": {
                   "anyOf": [
@@ -9998,7 +10008,17 @@
               ]
             },
             "clash_mode": {
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
             },
             "network_type": {
               "anyOf": [
@@ -10650,7 +10670,17 @@
               ]
             },
             "clash_mode": {
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
             },
             "network_type": {
               "anyOf": [
@@ -17185,7 +17215,17 @@
                   ]
                 },
                 "clash_mode": {
-                  "type": "string"
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  ]
                 },
                 "network_type": {
                   "anyOf": [
