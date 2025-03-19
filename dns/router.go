@@ -1118,6 +1118,7 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
 	metadata.Destination = M.Socksaddr{}
 	metadata.SniffHost = ""
 	metadata.SniffHasECHExtension = false
+	metadata.CacheIPs = nil
 	metadata.QueryType = message.Question[0].Qtype
 	metadata.DNSResponse = nil
 	metadata.NamedDNSResponses = nil
@@ -1364,6 +1365,7 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
 	metadata.Destination = M.Socksaddr{}
 	metadata.SniffHost = ""
 	metadata.SniffHasECHExtension = false
+	metadata.CacheIPs = nil
 	metadata.Domain = FqdnToDomain(domain)
 	metadata.DNSResponse = nil
 	metadata.NamedDNSResponses = nil
