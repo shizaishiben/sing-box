@@ -46,6 +46,7 @@ type Router struct {
 	client                 adapter.DNSClient
 	rawRules               []option.DNSRule
 	rules                  []adapter.DNSRule
+	ruleByUUID             map[string]adapter.DNSRule
 	defaultDomainStrategy  C.DomainStrategy
 	dnsReverseMapping      *freelru.Cache[netip.Addr, string]
 	dnsECHPublicNames      *freelru.Cache[string, string]
@@ -67,6 +68,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 		powerManager:           service.FromContext[*powerreport.Manager](ctx),
 		rawRules:               make([]option.DNSRule, 0, len(options.Rules)),
 		rules:                  make([]adapter.DNSRule, 0, len(options.Rules)),
+		ruleByUUID:             make(map[string]adapter.DNSRule),
 		defaultDomainStrategy:  C.DomainStrategy(options.Strategy),
 		defaultRejectRcode:     options.DefaultRejectRcode.Build(),
 		allowResolverDiscovery: options.AllowResolverDiscovery,
@@ -174,6 +176,10 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			return nil
 		}
 		r.rules = newRules
+		r.ruleByUUID = make(map[string]adapter.DNSRule)
+		for _, rule := range newRules {
+			r.ruleByUUID[rule.UUID()] = rule
+		}
 		r.legacyDNSMode = legacyDNSMode
 		r.started = true
 		r.rulesAccess.Unlock()
@@ -303,6 +309,9 @@ func (r *Router) matchDNS(ctx context.Context, rules []adapter.DNSRule, allowFak
 	}
 	for ; currentRuleIndex < len(rules); currentRuleIndex++ {
 		currentRule := rules[currentRuleIndex]
+		if currentRule.Disabled() {
+			continue
+		}
 		if currentRule.WithAddressLimit() && !isAddressQuery {
 			continue
 		}
@@ -604,6 +613,9 @@ func (r *Router) walkDNSRules(ctx context.Context, rules []adapter.DNSRule, mess
 	}
 	for ; state.ruleIndex < len(rules); state.ruleIndex++ {
 		currentRule := rules[state.ruleIndex]
+		if currentRule.Disabled() {
+			continue
+		}
 		hasBindings := len(currentRule.MatchResponseTags()) > 0 || currentRule.MatchResponseAnonymous()
 		if hasBindings {
 			r.settleDNSFutures(ctx, message, state)
@@ -847,6 +859,9 @@ func (r *Router) sweepArmedDNSRules(ctx context.Context, message *mDNS.Msg, stat
 			continue
 		}
 		state.armedRules = append(state.armedRules[:index], state.armedRules[index+1:]...)
+		if armed.rule.Disabled() {
+			continue
+		}
 		metadata.ResetRuleCache()
 		if armed.bindsAnonymous {
 			if armed.anonymousFuture != nil {
@@ -1484,6 +1499,13 @@ func (r *Router) Rules() []adapter.DNSRule {
 	r.rulesAccess.RLock()
 	defer r.rulesAccess.RUnlock()
 	return r.rules
+}
+
+func (r *Router) Rule(uuid string) (adapter.DNSRule, bool) {
+	r.rulesAccess.RLock()
+	defer r.rulesAccess.RUnlock()
+	rule, exists := r.ruleByUUID[uuid]
+	return rule, exists
 }
 
 func findLastCNAMETarget(name string, records []mDNS.RR, qType uint16) string {
