@@ -2,6 +2,7 @@ package local
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 
@@ -36,13 +37,20 @@ type Transport struct {
 	preferredResolver *PreferredDomainResolver
 	dialer            N.Dialer
 	preferGo          bool
+	implicitDefault   bool
 	resolved          ResolvedResolver
 	mdnsTransport     adapter.DNSTransport
 	mdnsScope         *adapter.Scope
-	configSource      *systemconfig.Source
+	configSource      systemConfigSource
 	system            systemResolver
 	serverSet         atomic.Pointer[localServerSet]
 	serverSetAccess   sync.Mutex
+}
+
+type systemConfigSource interface {
+	Configuration() *systemconfig.Config
+	Reset()
+	Close() error
 }
 
 func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, options option.LocalDNSServerOptions) (adapter.DNSTransport, error) {
@@ -61,6 +69,7 @@ func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, opt
 		preferredResolver: preferredResolver,
 		dialer:            transportDialer,
 		preferGo:          options.PreferGo,
+		implicitDefault:   options.ImplicitDefault,
 		configSource:      systemconfig.NewSource(ctx),
 	}, nil
 }
@@ -71,7 +80,7 @@ func (t *Transport) Start(stage adapter.StartStage, scope *adapter.Scope) error 
 	case adapter.StartStateInitialize:
 		scope.Add(t.configSource.Close)
 		if !t.preferGo {
-			resolvedResolver, err := NewResolvedResolver(t.ctx, t.logger)
+			resolvedResolver, err := newResolvedResolver(t.ctx, t.logger, t.implicitDefault)
 			if err == nil {
 				scope.Add(resolvedResolver.Close)
 				err = resolvedResolver.Start()
@@ -135,6 +144,9 @@ func (t *Transport) PreferredDomain(domain string) bool {
 func (t *Transport) Environment() []string {
 	systemConfig := t.configSource.Configuration()
 	if t.resolved != nil && systemConfig.SystemdResolved {
+		if t.resolved.Fallback() {
+			return append([]string{"resolv.conf"}, systemConfig.Signature()...)
+		}
 		return t.resolved.Environment()
 	}
 	return systemConfig.Signature()
@@ -156,6 +168,10 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 }
 
 func (t *Transport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+	if err := ctx.Err(); err != nil {
+		callback(nil, err)
+		return
+	}
 	question := message.Question[0]
 	response := t.preferredResolver.Lookup(message)
 	if response != nil {
@@ -172,7 +188,22 @@ func (t *Transport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callba
 	}
 	systemConfig := t.configSource.Configuration()
 	if t.resolved != nil && systemConfig.SystemdResolved {
-		t.resolved.ExchangeAsync(ctx, message, callback)
+		t.resolved.ExchangeAsync(ctx, message, func(response *mDNS.Msg, err error) {
+			if !errors.Is(err, errResolvedUnavailable) {
+				callback(response, err)
+				return
+			}
+			if err = ctx.Err(); err != nil {
+				callback(nil, err)
+				return
+			}
+			systemConfig := t.configSource.Configuration()
+			if err = checkResolvedFallback(t.ctx, systemConfig.Servers); err != nil {
+				callback(nil, err)
+				return
+			}
+			t.exchangeAsync(ctx, message, systemConfig, question.Name, callback)
+		})
 		return
 	}
 	t.exchangeAsync(ctx, message, systemConfig, question.Name, callback)
