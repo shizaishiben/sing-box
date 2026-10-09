@@ -1,0 +1,1196 @@
+name: build All
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Artifact Version'
+        required: true
+        type: string
+      android_client:
+        description: 'Android Client Branch'
+        required: true
+        default: reF1nd-testing
+        type: choice
+        options:
+          - reF1nd-oldstable
+          - reF1nd-stable
+          - reF1nd-testing
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GOCACHE: ${{ github.workspace }}/.cache/go-build
+  EXTRA_BUILD_TAGS: with_grpc,with_v2ray_api,with_embedded_tor,with_ebpf
+
+jobs:
+  #1. Android 构建
+  android:
+    name: Build Android binary
+    runs-on: ubuntu-26.04
+    strategy:
+      matrix:
+        include:
+          - { goarch: arm64, goarm: "-", ndk: aarch64-linux-android23, output: arm64-v8a }
+          - { goarch: arm, goarm: "7", ndk: armv7a-linux-androideabi23, output: armeabi-v7a }
+          - { goarch: "386", goarm: "-", ndk: i686-linux-android23, output: x86 }
+          - { goarch: amd64, goarm: "-", ndk: x86_64-linux-android23, output: x86_64 }
+    steps:
+      - name: checkout sing-box
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.8
+          cache: false
+
+      - name: Cache Go modules
+        uses: actions/cache@v5
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-linux-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-linux-
+
+      # Cache the original tool directory: setup-ndk's local copy can retain
+      # symlinks into a previous runner's installation.
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.tool_cache }}/ndk/r28
+          key: all-ndk-toolcache-v1-${{ runner.os }}-${{ runner.arch }}-r28
+
+      - name: Setup Android NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        uses: nttld/setup-ndk@v1.6.0
+        id: setup-ndk
+        with:
+          ndk-version: r28
+          add-to-path: false
+          local-cache: false
+
+      - name: Verify Android NDK tools
+        id: verify-ndk
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path || format('{0}/ndk/r28/x64', runner.tool_cache) }}
+        run: |
+          set -euo pipefail
+          "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version
+          "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --version
+          echo "ndk-path=$NDK_HOME" >> "$GITHUB_OUTPUT"
+
+      - name: Setup OpenJDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Cache Go build outputs
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.GOCACHE }}
+          key: all-go-v1-${{ runner.os }}-${{ runner.arch }}-android-${{ matrix.output }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-${{ github.sha }}
+          restore-keys: |
+            all-go-v1-${{ runner.os }}-${{ runner.arch }}-android-${{ matrix.output }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-
+
+      - name: Set build tags
+        run: |
+          set -xeuo pipefail
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS),with_grpc,with_v2ray_api,with_embedded_tor,with_ebpf"
+          echo "BUILD_TAGS=${TAGS}" >> "${GITHUB_ENV}"
+      - name: Set shared ldflags
+        run: |
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "${GITHUB_ENV}"
+      - name: Build Android
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          NDK_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CGO_ENABLED=1 GOOS=android GOARCH=${{ matrix.goarch }}
+          unset GOARM GOAMD64
+          if [ "${{ matrix.goarm }}" != "-" ]; then export GOARM="${{ matrix.goarm }}"; fi
+          export CC="${NDK_BIN}/${{ matrix.ndk }}-clang"
+          go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+        env:
+          ANDROID_NDK_HOME: ${{ steps.verify-ndk.outputs.ndk-path }}
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sing-box-${{ github.event.inputs.version }}-android-${{ matrix.output }}
+          path: dist/sing-box
+          compression-level: 0
+
+  #2. Linux 构建
+  linux:
+    name: Build Linux
+    runs-on: ubuntu-26.04
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64glibc, variant: glibc, naive: true }
+          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64v3glibc, variant: glibc, naive: true }
+          - { goos: linux, goarch: arm64, output: arm64glibc, variant: glibc, naive: true }
+          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64purego, variant: purego, naive: true, openwrt: "x86_64" }
+          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64v3purego, variant: purego, naive: true, openwrt: "x86_64" }
+          - { goos: linux, goarch: arm64, output: arm64purego, variant: purego, naive: true, openwrt: "aarch64_cortex-a53 aarch64_cortex-a72 aarch64_cortex-a76 aarch64_generic" }
+          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64musl, variant: musl, naive: true }
+          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64v3musl, variant: musl, naive: true }
+          - { goos: linux, goarch: arm64, output: arm64musl, variant: musl, naive: true }
+
+    steps:
+      - name: checkout sing-box
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.8
+          cache: false
+
+      - name: Cache Go modules for Linux and Android
+        uses: actions/cache@v5
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-linux-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-linux-
+
+      - name: Cache Go build outputs
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.GOCACHE }}
+          key: all-go-v1-${{ runner.os }}-${{ runner.arch }}-linux-${{ matrix.output }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-${{ github.sha }}
+          restore-keys: |
+            all-go-v1-${{ runner.os }}-${{ runner.arch }}-linux-${{ matrix.output }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-
+
+      - name: Clone cronet-go
+        if: matrix.naive && matrix.variant != 'purego'
+        run: |
+          set -xeuo pipefail
+          CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
+          git init ~/cronet-go
+          git -C ~/cronet-go remote add origin https://github.com/sagernet/cronet-go.git
+          git -C ~/cronet-go sparse-checkout set --no-cone '/*' '!/lib'
+          git -C ~/cronet-go fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C ~/cronet-go checkout FETCH_HEAD
+          git -C ~/cronet-go submodule update --init --recursive --depth=1
+      - name: Regenerate Debian keyring
+        if: matrix.naive && matrix.variant != 'purego'
+        run: |
+          set -xeuo pipefail
+          rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
+          cd ~/cronet-go
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
+      - name: Cache Chromium toolchain
+        if: matrix.naive && matrix.variant != 'purego'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/cronet-go/naiveproxy/src/third_party/llvm-build
+            ~/cronet-go/naiveproxy/src/gn/out
+            ~/cronet-go/naiveproxy/src/out/sysroot-build
+            ~/cronet-go/naiveproxy/src/build/linux/*-sysroot
+          key: all-cronet-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.goarch }}-${{ matrix.variant }}-${{ hashFiles('.github/CRONET_GO_VERSION') }}
+
+      - name: Download Chromium toolchain
+        if: matrix.naive && matrix.variant != 'purego'
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          if [[ "${{ matrix.variant }}" == "musl" ]]; then
+            go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} --libc=musl download-toolchain
+          else
+            go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} download-toolchain
+          fi
+      - name: Set Chromium toolchain environment
+        if: matrix.naive && matrix.variant != 'purego'
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          if [[ "${{ matrix.variant }}" == "musl" ]]; then
+            go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} --libc=musl env >> $GITHUB_ENV
+          else
+            go run ./cmd/build-naive --target=linux/${{ matrix.goarch }} env >> $GITHUB_ENV
+          fi
+      - name: Set build tags
+        run: |
+          set -xeuo pipefail
+          if [[ "${{ matrix.naive }}" == "true" ]]; then
+            TAGS="$(cat release/DEFAULT_BUILD_TAGS),with_grpc,with_v2ray_api,with_embedded_tor,with_ebpf"
+          else
+            TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS),${EXTRA_BUILD_TAGS}"
+          fi
+          if [[ "${{ matrix.variant }}" == "purego" ]]; then
+            TAGS="${TAGS},with_purego"
+          elif [[ "${{ matrix.variant }}" == "musl" ]]; then
+            TAGS="${TAGS},with_musl"
+          fi
+          echo "BUILD_TAGS=${TAGS}" >> "${GITHUB_ENV}"
+      - name: Set shared ldflags
+        run: |
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "${GITHUB_ENV}"
+      - name: Set variables
+        run: |
+          if [[ "${{ matrix.variant }}" == "purego" ]]; then
+            echo "CGO_ENABLED=0" >> $GITHUB_ENV
+          else
+            echo "CGO_ENABLED=1" >> $GITHUB_ENV
+          fi
+          echo "GOOS=${{ matrix.goos }}" >> $GITHUB_ENV
+          echo "GOARCH=${{ matrix.goarch }}" >> $GITHUB_ENV
+          echo "GOAMD64=${{ matrix.goamd64 }}" >> $GITHUB_ENV
+
+      - name: Build linux
+        run: |
+          go env
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box -tags "${{ env.BUILD_TAGS }}" \
+          -ldflags "-X github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }} ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+      - name: Extract libcronet.so
+        if: matrix.variant == 'purego' && matrix.naive
+        run: |
+          set -xeuo pipefail
+          CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
+          LIBRARY_PATH="lib/${{ matrix.goos }}_${{ matrix.goarch }}/libcronet.so"
+          git init "$RUNNER_TEMP/cronet-go-lib"
+          git -C "$RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$RUNNER_TEMP/cronet-go-lib" sparse-checkout set --no-cone "/$LIBRARY_PATH"
+          git -C "$RUNNER_TEMP/cronet-go-lib" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C "$RUNNER_TEMP/cronet-go-lib" checkout FETCH_HEAD
+          cp "$RUNNER_TEMP/cronet-go-lib/$LIBRARY_PATH" dist/
+      - name: Pack
+        run: |
+          cp LICENSE dist/
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sing-box-${{ github.event.inputs.version }}-${{ matrix.goos }}-${{ matrix.output }}
+          path: "dist"
+          compression-level: 0
+
+  #3. Darwin 构建
+  darwin:
+    name: Build Darwin
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64 }
+          - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64v3 }
+          - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64-old, legacy_go124: true, legacy_name: "macos-11" }
+          - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64v3-old, legacy_go124: true, legacy_name: "macos-11" }
+          - { goos: darwin, goarch: arm64, output: arm64 }
+          - { goos: darwin, goarch: amd64, goamd64: v1, legacy_osx: true, legacy_name: "macos-10.13", output: amd64-oold }
+          - { goos: darwin, goarch: amd64, goamd64: v3, legacy_osx: true, legacy_name: "macos-10.13", output: amd64v3-oold }
+    steps:
+      - name: checkout sing-box
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Setup Go
+        if: ${{ ! matrix.legacy_osx }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.8
+          cache: false
+
+      - name: Cache Go modules for Darwin
+        uses: actions/cache@v5
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-macos-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-macos-
+
+      - name: Cache Go build outputs
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.GOCACHE }}
+          key: all-go-v1-${{ runner.os }}-${{ runner.arch }}-darwin-${{ matrix.output }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-${{ github.sha }}
+          restore-keys: |
+            all-go-v1-${{ runner.os }}-${{ runner.arch }}-darwin-${{ matrix.output }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-
+
+      - name: Cache Go for macOS 10.13
+        if: matrix.legacy_osx
+        id: cache-go-for-macos1013
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/go/go_osx
+          key: go_osx_1268
+
+      - name: Setup Go for macOS 10.13
+        if: matrix.legacy_osx && steps.cache-go-for-macos1013.outputs.cache-hit != 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |-
+          .github/setup_go_for_macos1013.sh
+      - name: Setup Go for macOS 10.13
+        if: matrix.legacy_osx
+        run: |-
+          echo "PATH=$HOME/go/go_osx/bin:$PATH" >> $GITHUB_ENV
+          echo "GOROOT=$HOME/go/go_osx" >> $GITHUB_ENV
+      - name: Set build tags
+        run: |
+          set -xeuo pipefail
+          if [[ "${{ matrix.legacy_osx }}" != "true" ]]; then
+            TAGS="$(cat release/DEFAULT_BUILD_TAGS),with_grpc,with_v2ray_api,with_embedded_tor,with_ebpf"
+          else
+            TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS),with_grpc,with_v2ray_api,with_embedded_tor,with_ebpf"
+          fi
+          echo "BUILD_TAGS=${TAGS}" >> "${GITHUB_ENV}"
+      - name: Set shared ldflags
+        run: |
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "${GITHUB_ENV}"
+      - name: Set variables
+        run: |
+          echo "CGO_ENABLED=1" >> $GITHUB_ENV
+          echo "GOOS=${{ matrix.goos }}" >> $GITHUB_ENV
+          echo "GOARCH=${{ matrix.goarch }}" >> $GITHUB_ENV
+          echo "GOAMD64=${{ matrix.goamd64 }}" >> $GITHUB_ENV
+          echo "SUFFIX=${{ matrix.goos == 'windows' && '.exe' || '' }}" >> $GITHUB_ENV
+      - name: Build Darwin
+        run: |
+          mkdir -p dist
+          go env
+          go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+      - name: Upload Darwin artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sing-box-${{ github.event.inputs.version }}-${{ matrix.goos }}-${{ matrix.output }}
+          path: dist
+          compression-level: 0
+
+  #4. Windows 构建
+  windows:
+    name: Build Windows
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64, naive: true }
+          - { goos: windows, goarch: amd64, goamd64: v3, output: amd64v3, naive: true }
+          - { goos: windows, goarch: arm64, output: arm64, naive: true }
+
+    steps:
+      - name: checkout sing-box
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Cache Go modules
+        uses: actions/cache@v5
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-windows-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-windows-
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.8
+          cache: false
+
+      - name: Cache Go build outputs
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.GOCACHE }}
+          key: all-go-v1-${{ runner.os }}-${{ runner.arch }}-windows-${{ matrix.output }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-${{ github.sha }}
+          restore-keys: |
+            all-go-v1-${{ runner.os }}-${{ runner.arch }}-windows-${{ matrix.output }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-
+
+      - name: Build
+        run: |
+          $TAGS = "$(Get-Content release/DEFAULT_BUILD_TAGS_WINDOWS),$env:EXTRA_BUILD_TAGS"
+          $LDFLAGS_SHARED = Get-Content release/LDFLAGS
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box.exe -tags "$TAGS" `
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }}' $LDFLAGS_SHARED -s -w -buildid=" `
+          ./cmd/sing-box
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOAMD64: ${{ matrix.goamd64 }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract libcronet.dll
+        run: |
+          $CRONET_GO_VERSION = Get-Content .github/CRONET_GO_VERSION
+          $LIBRARY_PATH = "lib/windows_${{ matrix.goarch }}/libcronet.dll"
+          git init "$env:RUNNER_TEMP/cronet-go-lib"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" sparse-checkout set --no-cone "/$LIBRARY_PATH"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" checkout FETCH_HEAD
+          Copy-Item "$env:RUNNER_TEMP/cronet-go-lib/$LIBRARY_PATH" dist
+      - name: Archive
+        run: |
+          Copy-Item LICENSE dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sing-box-${{ github.event.inputs.version }}-${{ matrix.goos }}-${{ matrix.output }}
+          path: dist/*
+          compression-level: 0
+
+  windows_legacy:
+    name: Build Windows 7
+    runs-on: ubuntu-26.04
+    strategy:
+      matrix:
+        include:
+          - { goos: windows, goarch: amd64, output: amd64-old }
+          - { goos: windows, goarch: "386", output: 386-old }
+    steps:
+      - name: checkout sing-box
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Cache Go modules
+        uses: actions/cache@v5
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-linux-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-linux-
+      - name: Cache Go for Windows 7
+        id: cache-go-for-windows7
+        uses: actions/cache@v5
+        with:
+          path: ~/go/go_win7
+          key: go-win7-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/setup_go_for_windows7.sh') }}
+      - name: Setup Go for Windows 7
+        if: steps.cache-go-for-windows7.outputs.cache-hit != 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .github/setup_go_for_windows7.sh
+      - name: Activate Go for Windows 7
+        run: |-
+          echo "PATH=$HOME/go/go_win7/bin:$PATH" >> "$GITHUB_ENV"
+          echo "GOROOT=$HOME/go/go_win7" >> "$GITHUB_ENV"
+      - name: Cache Go build outputs
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.GOCACHE }}
+          key: all-go-v1-${{ runner.os }}-${{ runner.arch }}-windows-${{ matrix.output }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-${{ github.sha }}
+          restore-keys: |
+            all-go-v1-${{ runner.os }}-${{ runner.arch }}-windows-${{ matrix.output }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-
+      - name: Build
+        run: |
+          set -xeuo pipefail
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS),${EXTRA_BUILD_TAGS}"
+          LDFLAGS_SHARED=$(cat release/LDFLAGS)
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box.exe -tags "$TAGS" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Archive
+        run: |
+          cp LICENSE dist/
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sing-box-${{ github.event.inputs.version }}-${{ matrix.goos }}-${{ matrix.output }}
+          path: dist/*
+          compression-level: 0
+
+  #5. Android library 构建
+  build_android_library:
+    name: Build Android library (${{ matrix.go_arch }})
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        go_arch: ['386', amd64, arm, arm64]
+    steps:
+      - name: Checkout sing-box
+        uses: actions/checkout@v6
+        with:
+          path: sing-box
+          fetch-depth: 1
+
+      - name: Set build tag
+        run: git -C sing-box tag -f "v${{ github.event.inputs.version }}" "${{ github.sha }}"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.8
+          cache: false
+
+      - name: Cache Go modules
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-linux-${{ hashFiles('sing-box/go.sum') }}
+          restore-keys: go-mod-linux-
+
+      - name: Cache Go build outputs
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.GOCACHE }}
+          key: all-go-v1-${{ runner.os }}-${{ runner.arch }}-build_android_library-${{ matrix.go_arch }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-${{ github.sha }}
+          restore-keys: |
+            all-go-v1-${{ runner.os }}-${{ runner.arch }}-build_android_library-${{ matrix.go_arch }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-
+
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.tool_cache }}/ndk/r28
+          key: all-ndk-toolcache-v1-${{ runner.os }}-${{ runner.arch }}-r28
+
+      - name: Setup Android NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1.6.0
+        with:
+          ndk-version: r28
+          add-to-path: false
+          local-cache: false
+
+      - name: Verify Android NDK tools
+        id: verify-ndk
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path || format('{0}/ndk/r28/x64', runner.tool_cache) }}
+        run: |
+          set -euo pipefail
+          "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version
+          "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --version
+          echo "ndk-path=$NDK_HOME" >> "$GITHUB_OUTPUT"
+
+      - name: Setup OpenJDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set build tags
+        working-directory: sing-box
+        run: |
+          set -euo pipefail
+          LIBBOX_TAGS="with_quic,with_wireguard,with_utls,with_naive_outbound,with_clash_api,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0,with_tailscale,ts_omit_logtail,ts_omit_ssh,ts_omit_drive,ts_omit_taildrop,ts_omit_webclient,ts_omit_doctor,ts_omit_capture,ts_omit_kube,ts_omit_aws,ts_omit_synology,ts_omit_bird"
+          RELEASE_TAGS="$(cat release/DEFAULT_BUILD_TAGS),with_grpc,with_v2ray_api,with_embedded_tor,with_ebpf"
+          ALL_TAGS="${LIBBOX_TAGS},${RELEASE_TAGS}"
+          LEGACY_TAGS="$(printf '%s' "${ALL_TAGS}" | tr ',' '\n' | grep -vx with_naive_outbound | paste -sd, -)"
+          echo "LIBBOX_TAGS=${ALL_TAGS}" >> "${GITHUB_ENV}"
+          echo "LIBBOX_LEGACY_TAGS=${LEGACY_TAGS}" >> "${GITHUB_ENV}"
+
+      - name: Build Android libraries
+        working-directory: sing-box
+        env:
+          ANDROID_NDK_HOME: ${{ steps.verify-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          make lib_install
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gomobile bind -v -o libbox.aar -target android/${{ matrix.go_arch }} -androidapi 24 -javapkg=io.nekohasekai -libname=box -trimpath -buildvcs=false -tags "${LIBBOX_TAGS}" -ldflags "-X github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }} -X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0 -s -w -buildid=" ./experimental/libbox
+          gomobile bind -v -o libbox-legacy.aar -target android/${{ matrix.go_arch }} -androidapi 21 -javapkg=io.nekohasekai -libname=box -trimpath -buildvcs=false -tags "${LIBBOX_LEGACY_TAGS}" -ldflags "-X github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }} -X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0 -s -w -buildid=" ./experimental/libbox
+          mkdir -p "dist/${{ matrix.go_arch }}"
+          mv libbox.aar libbox-legacy.aar "dist/${{ matrix.go_arch }}/"
+
+      - name: Upload Android libraries
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: android-library-${{ matrix.go_arch }}
+          path: sing-box/dist/${{ matrix.go_arch }}/*.aar
+          compression-level: 0
+
+  #6. Merge Android libraries
+  merge_android_library:
+    name: Merge Android libraries
+    runs-on: ubuntu-26.04
+    needs: [build_android_library]
+    steps:
+      - name: Checkout sing-box
+        uses: actions/checkout@v6
+        with:
+          path: sing-box
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.8
+          cache: false
+
+      - name: Cache Go build outputs
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.GOCACHE }}
+          key: all-go-v1-${{ runner.os }}-${{ runner.arch }}-merge_android_library-host-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-${{ github.sha }}
+          restore-keys: |
+            all-go-v1-${{ runner.os }}-${{ runner.arch }}-merge_android_library-host-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-
+
+      - name: Download Android libraries
+        uses: actions/download-artifact@v8.0.0
+        with:
+          pattern: android-library-*
+          path: libbox-inputs
+
+      - name: Merge Android libraries
+        run: |
+          set -euo pipefail
+          libraries=("$GITHUB_WORKSPACE"/libbox-inputs/android-library-*/libbox.aar)
+          legacy_libraries=("$GITHUB_WORKSPACE"/libbox-inputs/android-library-*/libbox-legacy.aar)
+          test "${#libraries[@]}" -eq 4
+          test "${#legacy_libraries[@]}" -eq 4
+          cd sing-box
+          mkdir -p dist
+          go run ./cmd/internal/merge_aar -output dist/libbox.aar "${libraries[@]}"
+          go run ./cmd/internal/merge_aar -output dist/libbox-legacy.aar "${legacy_libraries[@]}"
+
+      - name: Upload merged Android libraries
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: android-library-merged
+          path: |
+            sing-box/dist/libbox.aar
+            sing-box/dist/libbox-legacy.aar
+          compression-level: 0
+
+  #7. Android 客户端构建
+  build_android:
+    name: Build Android (${{ matrix.variant }})
+    runs-on: ubuntu-26.04
+    needs: [merge_android_library]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: other
+            flavor_dir: other
+            task: :app:assembleOtherRelease
+          - variant: other-legacy
+            flavor_dir: otherLegacy
+            task: :app:assembleOtherLegacyRelease
+    steps:
+      - name: Checkout Android client
+        uses: actions/checkout@v6
+        with:
+          path: sfa
+          repository: reF1nd/sing-box-for-android
+          ref: ${{ github.event.inputs.android_client }}
+          submodules: recursive
+
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.tool_cache }}/ndk/r28
+          key: all-ndk-toolcache-v1-${{ runner.os }}-${{ runner.arch }}-r28
+
+      - name: Setup Android NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1.6.0
+        with:
+          ndk-version: r28
+          add-to-path: false
+          local-cache: false
+
+      - name: Verify Android NDK tools
+        id: verify-ndk
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path || format('{0}/ndk/r28/x64', runner.tool_cache) }}
+        run: |
+          set -euo pipefail
+          "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version
+          "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --version
+          echo "ndk-path=$NDK_HOME" >> "$GITHUB_OUTPUT"
+
+      - name: Setup OpenJDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+
+      - name: Get latest build tools version
+        id: sdk
+        run: echo "version=$(ls -1 "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Download merged Android libraries
+        uses: actions/download-artifact@v8.0.0
+        with:
+          name: android-library-merged
+          path: libbox
+
+      - name: Prepare Android client
+        run: |
+          set -euo pipefail
+          mkdir -p sfa/app/libs
+          cp libbox/libbox.aar libbox/libbox-legacy.aar sfa/app/libs/
+          sed -i "s/^VERSION_NAME=.*/VERSION_NAME=${{ github.event.inputs.version }}/" sfa/version.properties
+          version_code=$(grep '^VERSION_CODE=' sfa/version.properties | cut -d= -f2)
+          printf 'VERSION_NAME=%s\nVERSION_CODE=%s\n' "${{ github.event.inputs.version }}" "${version_code}" > sfa/local.properties
+          echo "org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8" >> sfa/gradle.properties
+          sed -i '/signingConfigs\.getByName/d' sfa/app/build.gradle.kts
+          sed -i 's/applicationId = "io\.reF1nd\.sfa"/applicationId = "io.xuzhimo.sfa"/' sfa/app/build.gradle.kts
+          chmod +x sfa/gradlew
+
+      - name: Build APKs
+        working-directory: sfa
+        env:
+          ANDROID_NDK_HOME: ${{ steps.verify-ndk.outputs.ndk-path }}
+        run: ./gradlew --build-cache --parallel --stacktrace ${{ matrix.task }}
+
+      - name: Sign APKs
+        uses: shizaishiben/sign-android-release@v2.0.5
+        env:
+          BUILD_TOOLS_VERSION: ${{ steps.sdk.outputs.version }}
+        with:
+          alias: ${{ secrets.ALIAS }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          releaseDirectory: sfa/app/build/outputs/apk/${{ matrix.flavor_dir }}/release
+          signingKeyBase64: ${{ secrets.SIGN_KEY }}
+
+      - name: Upload signed APKs
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sfa-${{ github.event.inputs.version }}-${{ matrix.variant }}-arm64-v8a
+          path: sfa/app/build/outputs/apk/${{ matrix.flavor_dir }}/release/*-arm64-v8a-signed.apk
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload signed APKs (armeabi-v7a)
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sfa-${{ github.event.inputs.version }}-${{ matrix.variant }}-armeabi-v7a
+          path: sfa/app/build/outputs/apk/${{ matrix.flavor_dir }}/release/*-armeabi-v7a-signed.apk
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload signed APKs (x86_64)
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sfa-${{ github.event.inputs.version }}-${{ matrix.variant }}-x86_64
+          path: sfa/app/build/outputs/apk/${{ matrix.flavor_dir }}/release/*-x86_64-signed.apk
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload signed APKs (x86)
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sfa-${{ github.event.inputs.version }}-${{ matrix.variant }}-x86
+          path: sfa/app/build/outputs/apk/${{ matrix.flavor_dir }}/release/*-x86-signed.apk
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload signed APKs (universal)
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sfa-${{ github.event.inputs.version }}-${{ matrix.variant }}-universal
+          path: sfa/app/build/outputs/apk/${{ matrix.flavor_dir }}/release/*-universal-signed.apk
+          if-no-files-found: error
+          compression-level: 0
+
+#8. build_linux_client 构建
+  linux_client:
+    name: Build linux client
+    runs-on: ubuntu-26.04
+    strategy:
+      matrix:
+        include:
+          - { desktop_arch: x64, go_arch: amd64 }
+          - { desktop_arch: arm64, go_arch: arm64 }
+          - { desktop_arch: armv7l, go_arch: arm, go_arm: "7" }
+    steps:
+      - name: checkout sing-box
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          path: sing-box
+
+      - name: Checkout sing-box-for-desktop
+        uses: actions/checkout@v6
+        with:
+          repository: reF1nd/sing-box-for-desktop
+          ref: reF1nd-main
+          path: sing-box-for-desktop
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.8
+          cache: false
+
+      - name: Cache Go modules
+        uses: actions/cache@v5
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-desktop-linux-${{ hashFiles('sing-box/go.sum') }}
+          restore-keys: go-mod-desktop-linux-
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4.4.0
+        with:
+          package_json_file: sing-box-for-desktop/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: sing-box-for-desktop/package.json
+          cache: pnpm
+          cache-dependency-path: |
+            sing-box-for-desktop/pnpm-lock.yaml
+            sing-box-for-desktop/dashboard/pnpm-lock.yaml
+      - name: Cache Go build outputs
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.GOCACHE }}
+          key: all-go-v1-${{ runner.os }}-${{ runner.arch }}-linux_client-${{ matrix.desktop_arch }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-${{ github.sha }}
+          restore-keys: |
+            all-go-v1-${{ runner.os }}-${{ runner.arch }}-linux_client-${{ matrix.desktop_arch }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-
+
+      - name: Enable full desktop core build tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in sing-box/release/DEFAULT_BUILD_TAGS*; do
+            tags=$(cat "$file")
+            printf '%s,%s\n' "$tags" "$EXTRA_BUILD_TAGS" > "$file"
+          done
+
+      - name: Set tag
+        shell: bash
+        working-directory: sing-box
+        run: |-
+          git ls-remote --exit-code --tags origin v${{ github.event.inputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
+          git tag v${{ github.event.inputs.version }} -f
+      - name: Update version
+        working-directory: sing-box
+        if: github.event_name == 'workflow_dispatch'
+        run: |-
+          go run -v ./cmd/internal/update_desktop_version --nightly
+      - name: Update nightly version
+        working-directory: sing-box
+        if: github.event_name != 'workflow_dispatch'
+        run: |-
+          go run -v ./cmd/internal/update_desktop_version --nightly
+      - name: Clone cronet-go
+        run: |
+          set -xeuo pipefail
+          CRONET_GO_VERSION=$(cat sing-box/.github/CRONET_GO_VERSION)
+          git init ~/cronet-go
+          git -C ~/cronet-go remote add origin https://github.com/sagernet/cronet-go.git
+          git -C ~/cronet-go sparse-checkout set --no-cone '/*' '!/lib'
+          git -C ~/cronet-go fetch --depth=1 origin "$CRONET_GO_VERSION"
+          git -C ~/cronet-go checkout FETCH_HEAD
+          git -C ~/cronet-go submodule update --init --recursive --depth=1
+      - name: Regenerate Debian keyring
+        run: |
+          set -xeuo pipefail
+          rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
+          cd ~/cronet-go
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
+      - name: Cache Chromium toolchain
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/cronet-go/naiveproxy/src/third_party/llvm-build
+            ~/cronet-go/naiveproxy/src/gn/out
+            ~/cronet-go/naiveproxy/src/out/sysroot-build
+            ~/cronet-go/naiveproxy/src/build/linux/*-sysroot
+          key: all-cronet-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.go_arch }}-glibc-${{ hashFiles('sing-box/.github/CRONET_GO_VERSION') }}
+
+      - name: Download Chromium toolchain
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          go run ./cmd/build-naive --target=linux/${{ matrix.go_arch }} download-toolchain
+      - name: Set Chromium toolchain environment
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          go run ./cmd/build-naive --target=linux/${{ matrix.go_arch }} env >> "$GITHUB_ENV"
+      - name: Install package tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update || true
+          sudo apt-get install -y debsigs libarchive-tools rpm zstd
+          echo '%_rpmformat 4' > "$HOME/.rpmmacros"
+      - name: Cache Electron downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/electron
+            ~/.cache/electron-builder
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: all-electron-${{ runner.os }}-${{ matrix.desktop_arch }}-${{ hashFiles('sing-box-for-desktop/pnpm-lock.yaml') }}
+          restore-keys: all-electron-${{ runner.os }}-${{ matrix.desktop_arch }}-
+
+      - name: Install dependencies
+        run: pnpm -C sing-box-for-desktop install --frozen-lockfile
+
+      - name: Build
+        run: pnpm -C sing-box-for-desktop package:linux -- deb rpm pacman ${{ matrix.desktop_arch }}
+        env:
+          CGO_ENABLED: '0'
+          GOARM: ${{ matrix.go_arm }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup package signing
+        run: |
+          set -euo pipefail
+          [[ -n "$GPG_KEY" ]] || { echo 'GPG_KEY is not configured' >&2; exit 1; }
+          [[ -n "$GPG_KEY_ID" ]] || { echo 'GPG_KEY_ID is not configured' >&2; exit 1; }
+          [[ -n "$GPG_PASSPHRASE" ]] || { echo 'GPG_PASSPHRASE is not configured' >&2; exit 1; }
+          SIGNING_GNUPG_HOME="$RUNNER_TEMP/package-signing-gnupg"
+          SIGNING_PASSPHRASE_FILE="$RUNNER_TEMP/package-signing-passphrase"
+          mkdir -m 700 "$SIGNING_GNUPG_HOME"
+          printf '%s' "$GPG_PASSPHRASE" > "$SIGNING_PASSPHRASE_FILE"
+          chmod 600 "$SIGNING_PASSPHRASE_FILE"
+          # Configure GPG directly without relying on debsigs --gpgopts.
+          # Every GPG invocation uses this isolated, noninteractive keyring.
+          cat > "$SIGNING_GNUPG_HOME/gpg.conf" <<EOF
+          batch
+          no-tty
+          pinentry-mode loopback
+          passphrase-file $SIGNING_PASSPHRASE_FILE
+          EOF
+          chmod 600 "$SIGNING_GNUPG_HOME/gpg.conf"
+          {
+            echo "GNUPGHOME=$SIGNING_GNUPG_HOME"
+            echo "SIGNING_PASSPHRASE_FILE=$SIGNING_PASSPHRASE_FILE"
+          } >> "$GITHUB_ENV"
+          printf '%s' "$GPG_KEY" | gpg \
+            --homedir "$SIGNING_GNUPG_HOME" \
+            --batch \
+            --pinentry-mode loopback \
+            --passphrase-file "$SIGNING_PASSPHRASE_FILE" \
+            --import
+          gpg --homedir "$SIGNING_GNUPG_HOME" \
+            --batch \
+            --list-secret-keys "$GPG_KEY_ID" >/dev/null
+          cat > "$HOME/.rpmmacros" <<EOF
+          %_rpmformat 4
+          %_gpg_name $GPG_KEY_ID
+          %_gpg_path $SIGNING_GNUPG_HOME
+          EOF
+        env:
+          GPG_KEY: ${{ secrets.GPG_KEY }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Sign Linux packages
+        run: |
+          set -euo pipefail
+          debsigs \
+            --sign=origin \
+            -k "$GPG_KEY_ID" \
+            sing-box-for-desktop/release/SFL-*.deb
+          rpmsign --addsign sing-box-for-desktop/release/SFL-*.rpm
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+
+      - name: Prepare upload
+        run: |
+          shopt -s nullglob
+          artifacts=(
+            sing-box-for-desktop/release/SFL-*.deb
+            sing-box-for-desktop/release/SFL-*.rpm
+            sing-box-for-desktop/release/SFL-*.pkg.tar.zst
+          )
+          if (( ${#artifacts[@]} != 3 )); then
+            echo "expected 3 Linux packages, found ${#artifacts[@]}" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          cp "${artifacts[@]}" dist
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v7
+        with:
+          name: SFL-${{ github.event.inputs.version }}-${{ matrix.desktop_arch }}-deb
+          path: dist/*.deb
+          compression-level: 0
+
+      - name: Upload RPM package
+        uses: actions/upload-artifact@v7
+        with:
+          name: SFL-${{ github.event.inputs.version }}-${{ matrix.desktop_arch }}-rpm
+          path: dist/*.rpm
+          compression-level: 0
+
+      - name: Upload pacman package
+        uses: actions/upload-artifact@v7
+        with:
+          name: SFL-${{ github.event.inputs.version }}-${{ matrix.desktop_arch }}-pacman
+          path: dist/*.pkg.tar.zst
+          compression-level: 0
+
+#7. build_windows_client 构建
+  windows_client:
+    name: Build Windows client
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { desktop_arch: x64, rust_target: x86_64-pc-windows-msvc }
+          - { desktop_arch: x86, rust_target: i686-pc-windows-msvc }
+          - { desktop_arch: arm64, rust_target: aarch64-pc-windows-msvc }
+    steps:
+      - name: checkout sing-box
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          path: sing-box
+
+      - name: Checkout sing-box-for-desktop
+        uses: actions/checkout@v6
+        with:
+          repository: reF1nd/sing-box-for-desktop
+          ref: reF1nd-main
+          path: sing-box-for-desktop
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.8
+          cache: false
+
+      - name: Cache Go modules
+        uses: actions/cache@v5
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-desktop-windows-${{ hashFiles('sing-box/go.sum') }}
+          restore-keys: go-mod-desktop-windows-
+
+      - name: Cache Go build outputs
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.GOCACHE }}
+          key: all-go-v1-${{ runner.os }}-${{ runner.arch }}-windows_client-${{ matrix.desktop_arch }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-${{ github.sha }}
+          restore-keys: |
+            all-go-v1-${{ runner.os }}-${{ runner.arch }}-windows_client-${{ matrix.desktop_arch }}-1.26.8-${{ hashFiles('**/go.sum', '**/release/DEFAULT_BUILD_TAGS*', '**/.github/setup_go_for_*.sh') }}-
+
+      - name: Cache Windows sharing module
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            sing-box-for-desktop/bin/windows-share-toolchain/cargo-target
+          key: windows-share-${{ matrix.rust_target }}-${{ hashFiles('sing-box-for-desktop/native/windows-share/Cargo.lock') }}
+          restore-keys: windows-share-${{ matrix.rust_target }}-
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: i686-pc-windows-msvc,aarch64-pc-windows-msvc
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4.4.0
+        with:
+          package_json_file: sing-box-for-desktop/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: sing-box-for-desktop/package.json
+          cache: pnpm
+          cache-dependency-path: |
+            sing-box-for-desktop/pnpm-lock.yaml
+            sing-box-for-desktop/dashboard/pnpm-lock.yaml
+      - name: Enable full desktop core build tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in sing-box/release/DEFAULT_BUILD_TAGS*; do
+            tags=$(cat "$file")
+            printf '%s,%s\n' "$tags" "$EXTRA_BUILD_TAGS" > "$file"
+          done
+
+      - name: Set tag
+        shell: pwsh
+        working-directory: sing-box
+        run: |-
+          git ls-remote --exit-code --tags origin v${{ github.event.inputs.version }}
+          if ($LASTEXITCODE -ne 0) {
+            "PUBLISHED=false" >> $env:GITHUB_ENV
+          }
+          git tag v${{ github.event.inputs.version }} -f
+      - name: Update version
+        working-directory: sing-box
+        if: github.event_name == 'workflow_dispatch'
+        run: |-
+          go run -v ./cmd/internal/update_desktop_version --nightly
+      - name: Update nightly version
+        working-directory: sing-box
+        if: github.event_name != 'workflow_dispatch'
+        run: |-
+          go run -v ./cmd/internal/update_desktop_version --nightly
+
+      - name: Setup signing
+        run: |-
+          $certificatePath = Join-Path $env:RUNNER_TEMP "windows-signing.p12"
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATES_P12))
+          @{
+            windows = @{
+              certificateFile = $certificatePath
+              certificatePassword = $env:WINDOWS_P12_PASSWORD
+            }
+          } | ConvertTo-Json -Depth 3 | Set-Content -Encoding utf8NoBOM sing-box-for-desktop/signing.local.json
+        env:
+          WINDOWS_CERTIFICATES_P12: ${{ secrets.WINDOWS_CERTIFICATES_P12 }}
+          WINDOWS_P12_PASSWORD: ${{ secrets.WINDOWS_P12_PASSWORD }}
+
+      - name: Cache Electron downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/electron
+            ~/.cache/electron-builder
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: all-electron-${{ runner.os }}-${{ matrix.desktop_arch }}-${{ hashFiles('sing-box-for-desktop/pnpm-lock.yaml') }}
+          restore-keys: all-electron-${{ runner.os }}-${{ matrix.desktop_arch }}-
+
+      - name: Install dependencies
+        run: |-
+          pnpm -C sing-box-for-desktop install --frozen-lockfile
+      - name: Build
+        run: pnpm -C sing-box-for-desktop package:win -- ${{ matrix.desktop_arch }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare upload
+        run: |-
+          $artifacts = @(Get-ChildItem sing-box-for-desktop/release/SFW-*.exe -File)
+          if ($artifacts.Count -ne 1) {
+            throw "expected one Windows installer for ${{ matrix.desktop_arch }}, found $($artifacts.Count)"
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $artifacts[0].FullName dist
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: SFW-${{ github.event.inputs.version }}-${{ matrix.desktop_arch }}
+          path: dist/SFW-*.exe
