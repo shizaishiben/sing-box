@@ -207,7 +207,7 @@ require (
 replace (
 	github.com/anytls/sing-anytls => github.com/reF1nd/sing-anytls-old v0.0.14-0.20261009171641-358fdab236d2
 	// Keep the stable sing implementation for sing-ebpf and all consumers.
-	github.com/sagernet/sing => github.com/sagernet/sing v0.9.7-0.20261110095939-f545d0260412
+	github.com/sagernet/sing => github.com/reF1nd/sing v0.9.7-0.20261120024443-b778e300716e
 	github.com/sagernet/sing-snell => github.com/reF1nd/sing-snell v0.0.0-20261111152839-c3d3cba7c508
 	github.com/sagernet/sing-tun => github.com/reF1nd/sing-tun v0.9.7-0.20261120024908-27df4de8d834
 )
