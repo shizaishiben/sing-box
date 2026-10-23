@@ -211,7 +211,7 @@ replace github.com/sagernet/sing-anytls => github.com/reF1nd/sing-anytls v0.0.0-
 
 replace github.com/sagernet/sing-snell => github.com/reF1nd/sing-snell v0.0.0-20261111152839-c3d3cba7c508
 
-replace github.com/sagernet/quic-go => github.com/reF1nd/quic-go v0.61.0-sing-box-mod.14.0.20261118143724-7ff7002f1df4
+replace github.com/sagernet/quic-go => github.com/reF1nd/quic-go v0.61.0-sing-box-mod.14.0.20261118143727-2730dfda6343
 
 replace github.com/sagernet/sing => github.com/reF1nd/sing v0.9.7-0.20261111053803-aff75de96033
 

@@ -13106,6 +13106,9 @@
             "disable_version_fallback": {
               "type": "boolean"
             },
+            "udp_fast_open": {
+              "type": "boolean"
+            },
             "idle_timeout": {
               "$ref": "#/$defs/Duration"
             },
