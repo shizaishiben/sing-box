@@ -384,19 +384,21 @@ func (t *Endpoint) start(scope *adapter.Scope) error {
 		t.systemDialer = systemDialer
 		t.server.Tun = wgTunDevice
 	}
+	selfBypassControl := dialer.AppendEBPFSelfBypass(t.network, nil)
 	if t.network.AutoRedirectOutputMark() != 0 {
-		netns.SetControlFunc(t.network.AutoRedirectOutputMarkFunc())
+		netns.SetControlFunc(control.Append(t.network.AutoRedirectOutputMarkFunc(), selfBypassControl))
 		scope.Add(func() error {
 			netns.SetControlFunc(nil)
 			return nil
 		})
 	} else if t.platformInterface != nil && t.platformInterface.UsePlatformNetworkInterfaces() {
 		if t.platformInterface.UsePlatformAutoDetectInterfaceControl() {
-			netns.SetControlFunc(func(network, address string, conn syscall.RawConn) error {
+			platformControl := func(network, address string, conn syscall.RawConn) error {
 				return control.Raw(conn, func(fileDescriptor uintptr) error {
 					return t.platformInterface.AutoDetectInterfaceControl(int(fileDescriptor))
 				})
-			})
+			}
+			netns.SetControlFunc(control.Append(platformControl, selfBypassControl))
 			scope.Add(func() error {
 				netns.SetControlFunc(nil)
 				return nil
@@ -405,9 +407,10 @@ func (t *Endpoint) start(scope *adapter.Scope) error {
 			// NEPacketTunnelProvider sockets are excluded from tunnel routes by
 			// NECP; the empty override only suppresses tailscale's own
 			// default-interface bind, which would select the sing-box utun.
-			netns.SetControlFunc(func(string, string, syscall.RawConn) error {
+			platformControl := func(string, string, syscall.RawConn) error {
 				return nil
-			})
+			}
+			netns.SetControlFunc(control.Append(platformControl, selfBypassControl))
 			scope.Add(func() error {
 				netns.SetControlFunc(nil)
 				return nil
@@ -415,8 +418,8 @@ func (t *Endpoint) start(scope *adapter.Scope) error {
 		}
 	} else {
 		bindFunc := t.network.AutoDetectInterfaceFunc()
-		if bindFunc != nil {
-			netns.SetControlFunc(bindFunc)
+		if bindFunc != nil || selfBypassControl != nil {
+			netns.SetControlFunc(control.Append(bindFunc, selfBypassControl))
 			netns.SetListenPacketFunc(t.listenPacket)
 			scope.Add(func() error {
 				netns.SetControlFunc(nil)
@@ -437,6 +440,21 @@ func (t *Endpoint) listenPacket(ctx context.Context, network string, address str
 		return nil, err
 	}
 	udpConn := packetConn.(*net.UDPConn)
+	if err = dialer.RegisterEBPFSelfBypassPacketConn(t.network, udpConn); err != nil {
+		_ = udpConn.Close()
+		return nil, err
+	}
+	rawConn, rawConnErr := udpConn.SyscallConn()
+	if rawConnErr != nil {
+		return udpConn, nil
+	}
+	cleanup := dialer.EBPFSelfBypassCleanup(t.network, rawConn)
+	wrapPacketConn := func(conn nettype.PacketConn) nettype.PacketConn {
+		if cleanup == nil {
+			return conn
+		}
+		return &selfBypassPacketConn{PacketConn: conn, cleanup: cleanup}
+	}
 	egressPool := tun.NewUDPEgressPool(tun.UDPEgressPoolOptions{
 		Logger:           t.logger,
 		Network:          network,
@@ -448,9 +466,9 @@ func (t *Endpoint) listenPacket(ctx context.Context, network string, address str
 	})
 	if !egressPool.SetEgressPort(udpConn.LocalAddr().(*net.UDPAddr).AddrPort().Port()) {
 		egressPool.Close()
-		return udpConn, nil
+		return wrapPacketConn(udpConn), nil
 	}
-	return tun.NewUDPEgressConn(udpConn, egressPool), nil
+	return wrapPacketConn(tun.NewUDPEgressConn(udpConn, egressPool)), nil
 }
 
 func (t *Endpoint) postStart(scope *adapter.Scope) error {
@@ -1125,4 +1143,19 @@ func (t *peerDNSQueryHandler) HandlePeerDNSQuery(ctx context.Context, query []by
 	compressedResponse := *response
 	compressedResponse.Compress = true
 	return compressedResponse.Pack()
+}
+
+type selfBypassPacketConn struct {
+	nettype.PacketConn
+	cleanup func()
+	once    sync.Once
+}
+
+func (c *selfBypassPacketConn) Close() error {
+	c.once.Do(func() {
+		if c.cleanup != nil {
+			c.cleanup()
+		}
+	})
+	return c.PacketConn.Close()
 }

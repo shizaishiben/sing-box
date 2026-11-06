@@ -19,18 +19,26 @@ import (
 )
 
 type slowOpenConn struct {
-	dialer      *tfo.Dialer
-	ctx         context.Context
-	cancel      context.CancelFunc
-	netns       string
-	network     string
-	destination M.Socksaddr
-	conn        atomic.Pointer[net.TCPConn]
-	create      chan struct{}
-	done        chan struct{}
-	access      sync.Mutex
-	closeOnce   sync.Once
-	err         error
+	dial         func(context.Context, string, string, []byte) (net.Conn, error)
+	ctx          context.Context
+	cancel       context.CancelFunc
+	netns        string
+	network      string
+	destination  M.Socksaddr
+	conn         atomic.Pointer[net.TCPConn]
+	create       chan struct{}
+	done         chan struct{}
+	access       sync.Mutex
+	closeOnce    sync.Once
+	closeHandler atomic.Value // func(*net.TCPConn)
+	err          error
+}
+
+func (c *slowOpenConn) closeTCP(conn *net.TCPConn) {
+	if handler, loaded := c.closeHandler.Load().(func(*net.TCPConn)); loaded {
+		handler(conn)
+	}
+	_ = conn.Close()
 }
 
 func DialSlowContext(dialer *tfo.Dialer, ctx context.Context, netns string, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -42,9 +50,13 @@ func DialSlowContext(dialer *tfo.Dialer, ctx context.Context, netns string, netw
 			return dialer.Dialer.DialContext(ctx, network, destination.AddrString())
 		}
 	}
+	return newSlowOpenConn(ctx, netns, network, destination, dialer.DialContext), nil
+}
+
+func newSlowOpenConn(ctx context.Context, netns string, network string, destination M.Socksaddr, dial func(context.Context, string, string, []byte) (net.Conn, error)) *slowOpenConn {
 	dialCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	return &slowOpenConn{
-		dialer:      dialer,
+		dial:        dial,
 		ctx:         dialCtx,
 		cancel:      cancel,
 		netns:       netns,
@@ -52,7 +64,7 @@ func DialSlowContext(dialer *tfo.Dialer, ctx context.Context, netns string, netw
 		destination: destination,
 		create:      make(chan struct{}),
 		done:        make(chan struct{}),
-	}, nil
+	}
 }
 
 func (c *slowOpenConn) Read(b []byte) (n int, err error) {
@@ -89,14 +101,14 @@ func (c *slowOpenConn) Write(b []byte) (n int, err error) {
 	default:
 	}
 	conn, err := listener.ListenNetworkNamespace[net.Conn](c.ctx, c.netns, func() (net.Conn, error) {
-		return c.dialer.DialContext(c.ctx, c.network, c.destination.String(), b)
+		return c.dial(c.ctx, c.network, c.destination.String(), b)
 	})
 	if err != nil {
 		c.err = err
 	} else {
 		select {
 		case <-c.done:
-			conn.Close()
+			c.closeTCP(conn.(*net.TCPConn))
 			err = os.ErrClosed
 			c.err = err
 		default:
@@ -114,7 +126,7 @@ func (c *slowOpenConn) Close() error {
 		c.cancel()
 		conn := c.conn.Load()
 		if conn != nil {
-			conn.Close()
+			c.closeTCP(conn)
 		}
 	})
 	return nil

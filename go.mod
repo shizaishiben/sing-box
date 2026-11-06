@@ -87,6 +87,7 @@ require (
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	filippo.io/hpke v0.4.0 // indirect
+	github.com/CHIZI-0618/sing-ebpf v0.1.0-beta.2.0.20261110183705-02db5a557177
 	github.com/RyuaNerin/go-krypto v1.3.0 // indirect
 	github.com/ajg/form v1.5.1 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
@@ -96,6 +97,7 @@ require (
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
 	github.com/axiomhq/hyperloglog v0.0.0-20240319100328-84253e514e02 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
+	github.com/cilium/ebpf v0.22.1-0.20260910105759-60e81073fdc6 // indirect
 	github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
 	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6 // indirect
 	github.com/coreos/go-oidc/v3 v3.17.0 // indirect
@@ -114,6 +116,7 @@ require (
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
+	github.com/golang/protobuf v1.5.4
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/certificate-transparency-go v1.3.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
@@ -132,7 +135,9 @@ require (
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138 // indirect
 	github.com/libp2p/go-netroute v0.2.1 // indirect
+	github.com/mdlayher/genetlink v1.4.0
 	github.com/mdlayher/socket v0.6.0 // indirect
+	github.com/mdlayher/wifi v0.9.0
 	github.com/mitchellh/go-ps v1.0.0 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.26 // indirect
@@ -199,8 +204,10 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/sagernet/sing-tun => github.com/reF1nd/sing-tun v0.9.7-0.20261120024908-27df4de8d834
-
-replace github.com/sagernet/sing-snell => github.com/reF1nd/sing-snell v0.0.0-20261111152839-c3d3cba7c508
-
-replace github.com/anytls/sing-anytls => github.com/reF1nd/sing-anytls-old v0.0.14-0.20261009171641-358fdab236d2
+replace (
+	github.com/anytls/sing-anytls => github.com/reF1nd/sing-anytls-old v0.0.14-0.20261009171641-358fdab236d2
+	// Keep the stable sing implementation for sing-ebpf and all consumers.
+	github.com/sagernet/sing => github.com/sagernet/sing v0.9.7-0.20261110095939-f545d0260412
+	github.com/sagernet/sing-snell => github.com/reF1nd/sing-snell v0.0.0-20261111152839-c3d3cba7c508
+	github.com/sagernet/sing-tun => github.com/reF1nd/sing-tun v0.9.7-0.20261120024908-27df4de8d834
+)

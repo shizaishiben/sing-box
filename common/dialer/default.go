@@ -238,6 +238,12 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	if options.TCPMultiPath {
 		dialer4.SetMultipathTCP(true)
 	}
+	if networkManager != nil {
+		appendEBPFSelfBypassDialer(networkManager, &dialer4)
+		appendEBPFSelfBypassDialer(networkManager, &dialer6)
+		appendEBPFSelfBypassDialer(networkManager, &udpDialer4)
+		appendEBPFSelfBypassDialer(networkManager, &udpDialer6)
+	}
 	tcpDialer4 := tfo.Dialer{Dialer: dialer4, DisableTFO: !options.TCPFastOpen}
 	tcpDialer6 := tfo.Dialer{Dialer: dialer6, DisableTFO: !options.TCPFastOpen}
 	return &DefaultDialer{
@@ -304,16 +310,29 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 			switch N.NetworkName(network) {
 			case N.NetworkUDP:
 				if !address.IsIPv6() {
-					return d.udpDialer4.DialContext(ctx, network, address.String())
+					return d.dialWithSelfBypass(ctx, d.udpDialer4, network, address.String())
 				} else {
-					return d.udpDialer6.DialContext(ctx, network, address.String())
+					return d.dialWithSelfBypass(ctx, d.udpDialer6, network, address.String())
 				}
 			}
-			if !address.IsIPv6() {
-				return DialSlowContext(&d.dialer4, ctx, d.netns, network, address)
-			} else {
-				return DialSlowContext(&d.dialer6, ctx, d.netns, network, address)
+			tcpDialer := &d.dialer4
+			if address.IsIPv6() {
+				tcpDialer = &d.dialer6
 			}
+			if d.selfBypassTracker() == nil {
+				return DialSlowContext(tcpDialer, ctx, d.netns, network, address)
+			}
+			if N.NetworkName(network) != N.NetworkTCP {
+				return d.dialWithSelfBypass(ctx, tcpDialer.Dialer, network, address.AddrString())
+			}
+			if tcpDialer.DisableTFO {
+				return d.dialWithSelfBypass(ctx, tcpDialer.Dialer, network, address.String())
+			}
+			return newSlowOpenConn(ctx, d.netns, network, address, func(ctx context.Context, network, address string, payload []byte) (net.Conn, error) {
+				return d.withSelfBypass(ctx, func(ctx context.Context) (net.Conn, error) {
+					return tcpDialer.DialContext(ctx, network, address, payload)
+				})
+			}), nil
 		})
 		return d.trackConn(ctx, address, conn, err)
 	} else {
@@ -452,7 +471,8 @@ func (d *DefaultDialer) UDPListenerControl() (control.Func, bool) {
 	if egressEnabled && d.networkManager.AutoRedirectOutputMark() == 0 {
 		listenerControl = control.Append(listenerControl, d.autoDetectBindFunc)
 	}
-	return listenerControl, egressEnabled
+	// External listeners bypass trackPacketConn and only expose a pre-bind control.
+	return AppendEBPFSelfBypass(d.networkManager, listenerControl), egressEnabled
 }
 
 func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr, conn net.Conn, err error) (net.Conn, error) {
@@ -468,6 +488,7 @@ func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr, 
 		}
 		conn = &udpConn{Conn: conn, rawConn: rawConn}
 	}
+	conn = bindEBPFSelfBypassConnLifecycle(d.networkManager, conn)
 	if d.connectionManager != nil {
 		conn = d.connectionManager.TrackConn(conn)
 	}
@@ -498,6 +519,11 @@ func (d *DefaultDialer) trackPacketConn(ctx context.Context, destination M.Socks
 	if err != nil {
 		return conn, err
 	}
+	if err = RegisterEBPFSelfBypassPacketConn(d.networkManager, conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	conn = bindEBPFSelfBypassPacketConnLifecycle(d.networkManager, conn)
 	if d.connectionManager != nil {
 		conn = d.connectionManager.TrackPacketConn(conn)
 	}
