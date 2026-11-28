@@ -1316,10 +1316,9 @@ jobs:
                           archive.add(group, arcname=group.name)
                   count += 1
               else:
-                  # APK、安装包直接上传；保留扩展名并加 artifact 前缀防重名。
+                  # APK、安装包保留构建生成的原文件名；重名时报错，避免覆盖。
                   for file in files:
-                      relative = "--".join(file.relative_to(group).parts)
-                      target = output / f"{group.name}--{relative}"
+                      target = output / file.name
                       if target.exists():
                           raise SystemExit(f"Duplicate asset name: {target.name}")
                       if file.stat().st_size == 0:
